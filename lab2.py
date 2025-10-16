@@ -266,7 +266,11 @@ def find_best_arima(series: pd.Series, max_p: int = MAX_P, max_q: int = MAX_Q):
             try:
                 with warnings.catch_warnings():
                     warnings.simplefilter('ignore')
-                    model = ARIMA(series, order=(p, d, q)).fit()
+                    # подавляем вывод L-BFGS-B
+                    try:
+                        model = ARIMA(series, order=(p, d, q)).fit(disp=False)
+                    except Exception:
+                        model = ARIMA(series, order=(p, d, q)).fit(method_kwargs={'disp': 0})
                 if model.aic < best_aic:
                     best_aic = model.aic
                     best_model = model
@@ -298,7 +302,8 @@ def build_bsts(series: pd.Series):
             with warnings.catch_warnings():
                 warnings.simplefilter('ignore')
                 model = UnobservedComponents(series, level=cfg['level'], seasonal=cfg['seasonal'], trend=cfg['trend'])
-                fitted = model.fit(maxiter=BSTS_MAX_ITER)
+                # подавляем вывод L-BFGS-B
+                fitted = model.fit(maxiter=BSTS_MAX_ITER, disp=False)
             if fitted.aic < best_aic:
                 best_aic = fitted.aic
                 best_model = fitted
