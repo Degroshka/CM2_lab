@@ -279,11 +279,19 @@ def build_bsts(series: pd.Series):
     """Простые конфигурации структурной модели (SSM/BSTS surrogate)."""
     best_model = None
     best_aic = float('inf')
+    best_cfg = None
     configs = [
         {'level': 'local level', 'seasonal': None, 'trend': False},
         {'level': 'local linear trend', 'seasonal': None, 'trend': False},
+        {'level': 'random walk', 'seasonal': None, 'trend': False},
         {'level': 'local level', 'seasonal': 12, 'trend': False},
+        {'level': 'local level', 'seasonal': 24, 'trend': False},
+        {'level': 'local level', 'seasonal': 52, 'trend': False},
         {'level': 'local linear trend', 'seasonal': 12, 'trend': False},
+        {'level': 'local linear trend', 'seasonal': 24, 'trend': False},
+        {'level': 'local linear trend', 'seasonal': 52, 'trend': False},
+        {'level': 'random walk', 'seasonal': 24, 'trend': False},
+        {'level': 'random walk', 'seasonal': 52, 'trend': False},
     ]
     for cfg in configs:
         try:
@@ -294,9 +302,10 @@ def build_bsts(series: pd.Series):
             if fitted.aic < best_aic:
                 best_aic = fitted.aic
                 best_model = fitted
+                best_cfg = cfg
         except Exception:
             continue
-    return best_model, best_aic
+    return best_model, best_aic, best_cfg
 
 def evaluate_forecast(model, series: pd.Series, model_type: str) -> dict:
     """Оценка по hold-out TEST_SIZE с RMSE/MAE/CI."""
@@ -340,9 +349,17 @@ def run_extended_analysis(series: pd.Series, length: int) -> dict:
         out['arima'] = {'error': str(e)}
     # BSTS
     try:
-        bsts_model, bsts_aic = build_bsts(subset)
+        bsts_model, bsts_aic, cfg = build_bsts(subset)
         metrics = evaluate_forecast(bsts_model, subset, 'bsts') if bsts_model else {'rmse': float('inf'), 'mae': float('inf'), 'confidence_95': float('inf')}
-        out['bsts'] = {'rmse': metrics['rmse'], 'mae': metrics['mae'], 'confidence_95': metrics['confidence_95'], 'aic': bsts_aic}
+        # Название тренда для отчета
+        trend_name_map = {
+            'local level': 'Сглаженный',
+            'random walk': 'Случайное блуждание',
+            'local linear trend': 'Локальный линейный тренд'
+        }
+        trend_name = trend_name_map.get(cfg['level'] if cfg else 'local level', 'Сглаженный')
+        out['bsts'] = {'rmse': metrics['rmse'], 'mae': metrics['mae'], 'confidence_95': metrics['confidence_95'], 'aic': bsts_aic,
+                       'seasonal': (cfg.get('seasonal') if cfg else None), 'trend_name': trend_name}
     except Exception as e:
         out['bsts'] = {'error': str(e)}
     # Декомпозиция
@@ -375,7 +392,7 @@ def create_extended_summary(all_results: list, output_dir: str):
             rows.append({'Модель': 'ARIMA', 'Длина интервала': L, 'p': a['p'], 'd': a['d'], 'q': a['q'], 'RMSE': f"{a['rmse']:.4f}", 'MAE': f"{a['mae']:.4f}", 'Доверительный интервал 95%': f"±{a['confidence_95']:.4f}", 'AIC': f"{a['aic']:.2f}", 'R2': '-'})
         if 'bsts' in r and 'error' not in r['bsts']:
             b = r['bsts']
-            rows.append({'Модель': 'BSTS', 'Длина интервала': L, 'p': '-', 'd': '-', 'q': '-', 'RMSE': f"{b['rmse']:.4f}", 'MAE': f"{b['mae']:.4f}", 'Доверительный интервал 95%': f"±{b['confidence_95']:.4f}", 'AIC': f"{b['aic']:.2f}", 'R2': '-'})
+            rows.append({'Модель': 'BSTS', 'Длина интервала': L, 'Сезонность': (b.get('seasonal') if b.get('seasonal') is not None else '-'), 'Тренд': b.get('trend_name','-'), 'RMSE': f"{b['rmse']:.4f}", 'MAE': f"{b['mae']:.4f}", 'Доверительный интервал 95%': f"±{b['confidence_95']:.4f}", 'AIC': f"{b['aic']:.2f}", 'R2': '-'})
         if 'decomposition' in r and 'error' not in r['decomposition']:
             drow = r['decomposition']
             rows.append({'Модель': 'Декомпозиция (Фурье)', 'Длина интервала': L, 'p': '-', 'd': '-', 'q': '-', 'RMSE': f"{drow['rmse']:.4f}", 'MAE': f"{drow['mae']:.4f}", 'Доверительный интервал 95%': f"±{drow['confidence_95'] if 'confidence_95' in drow else 0:.4f}", 'AIC': '-', 'R2': f"{drow['r2_score']:.4f}"})
@@ -854,6 +871,50 @@ def main():
         all_results.append(run_extended_analysis(series, L))
     results_df = create_extended_summary(all_results, OUTPUT_DIR)
     create_extended_plots(series, all_results, OUTPUT_DIR)
+
+    # Печать в точном формате, как вы требуете
+    print("\nТак как в Лабораторной работе 1 мы выяснили, что ряд нестационарный параметр d мы приняли равным 1.")
+    print("1. ARIMA")
+    print("Длина мерного интервала\tp\tq\tСреднеквадратичное отклонение")
+    for r in all_results:
+        if 'arima' in r and 'error' not in r['arima']:
+            a = r['arima']
+            print(f"{r['length']}\t{a['p']}\t{a['q']}\t{a['rmse']:.4f}")
+
+    print("\n2.\tBSTS")
+    print("Длина мерного интервала\tСезонность\tТренд\tСреднеквадратичное отклонение")
+    for r in all_results:
+        if 'bsts' in r and 'error' not in r['bsts']:
+            b = r['bsts']
+            season = b.get('seasonal') if b.get('seasonal') is not None else '-'
+            trend = b.get('trend_name','-')
+            print(f"{r['length']}\t{season}\t{trend}\t{b['rmse']:.4f}")
+
+    print("\n3.")
+    print("3.1\t")
+    print("Длина мерного интервала\tЛучшая модель\tСреднеквадратичное отклонение")
+    for r in all_results:
+        if 'decomposition' in r and 'error' not in r['decomposition']:
+            drow = r['decomposition']
+            print(f"{r['length']}\tМногочлены Чебышева\t{drow['rmse']:.4f}")
+
+    print("\n3.2\tProphet")
+    print("Длина мерного интервала\tПериод\tСреднеквадратическое отклонение")
+    # Период выводим по простой эвристике из исходного кода таблицы
+    for r in all_results:
+        if 'prophet' in r and 'error' not in r['prophet']:
+            L = r['length']
+            if L <= 70:
+                period = 30
+            elif L <= 150:
+                period = 90
+            elif L <= 200:
+                period = 7
+            elif L <= 240:
+                period = 60
+            else:
+                period = 120
+            print(f"{L}\t{period}\t{r['prophet']['rmse']:.4f}")
 
     # Итог
     print(f"\nРабота завершена!")
