@@ -55,7 +55,7 @@ ARIMA_TOP_MODELS = 3
 BSTS_MAX_ITER = 100
 
 # Интервалы и качество
-INTERVAL_LENGTHS = [50, 100, 200, 300]
+INTERVAL_LENGTHS = [62, 124, 186, 223]
 TEST_SIZE = 0.2
 CONFIDENCE_LEVEL = 1.96
 MIN_TEST_SIZE = 5
@@ -845,7 +845,7 @@ def main():
     
     # Расширенный анализ (ARIMA, BSTS, сравнения)
     print("\nЗапуск расширенного анализа моделей...")
-    interval_lengths = [l for l in [50, 100, 200, 300] if l <= len(series)]
+    interval_lengths = [l for l in INTERVAL_LENGTHS if l <= len(series)]
     if len(series) not in interval_lengths:
         interval_lengths.append(len(series))
     all_results = []
