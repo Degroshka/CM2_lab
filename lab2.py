@@ -531,6 +531,41 @@ def main():
         print(f"Ошибка загрузки: {e}")
         return
     
+    # Тест нормальности остатков (Шапиро–Уилка) на полном ряду для обеих моделей
+    try:
+        print("\nТест нормальности остатков (Шапиро–Уилка)")
+        print("-" * 60)
+        # Чебышев
+        cheb_full = fourier_decomposition(series)
+        if 'error' not in cheb_full:
+            with warnings.catch_warnings():
+                warnings.simplefilter("ignore")
+                sh_stat, sh_p = stats.shapiro(cheb_full['residuals'])
+            conclusion = (
+                "Отклоняем H0: остатки не имеют нормальное распределение"
+                if sh_p < 0.05 else
+                "Не отклоняем H0: остатки близки к нормальному распределению"
+            )
+            print(f"Чебышев: W = {sh_stat:.4f}, p-value = {sh_p:.4f} -> {conclusion}")
+        else:
+            print("Чебышев: не удалось получить остатки для теста")
+        # Prophet
+        prop_full = build_prophet_model(series)
+        if 'error' not in prop_full:
+            with warnings.catch_warnings():
+                warnings.simplefilter("ignore")
+                sh_stat, sh_p = stats.shapiro(prop_full['residuals'])
+            conclusion = (
+                "Отклоняем H0: остатки не имеют нормальное распределение"
+                if sh_p < 0.05 else
+                "Не отклоняем H0: остатки близки к нормальному распределению"
+            )
+            print(f"Prophet: W = {sh_stat:.4f}, p-value = {sh_p:.4f} -> {conclusion}")
+        else:
+            print("Prophet: не удалось получить остатки для теста")
+    except Exception as e:
+        print(f"Не удалось выполнить тест Шапиро–Уилка: {e}")
+
     # Создаем выходную директорию
     os.makedirs(OUTPUT_DIR, exist_ok=True)
     
