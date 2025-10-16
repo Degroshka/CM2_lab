@@ -1,11 +1,7 @@
 #!/usr/bin/env python3
 """
-Лабораторная работа №2 - РАСШИРЕННАЯ ВЕРСИЯ
-Построение регрессионных, авторегрессионных моделей и моделей в пространстве состояний
-
-НАСТРОЙКА ПАРАМЕТРОВ:
-Все основные параметры вынесены в раздел КОНФИГУРАЦИОННЫЕ ПАРАМЕТРЫ (строки 20-63).
-Для изменения поведения программы просто измените соответствующие константы.
+Лабораторная работа №2 - УПРОЩЕННАЯ ВЕРСИЯ
+Создание графиков декомпозиции и таблиц для отчета
 """
 
 import os
@@ -19,10 +15,9 @@ import matplotlib.pyplot as plt
 import seaborn as sns
 from scipy import stats
 from scipy.fft import fft, fftfreq
-from scipy.signal import periodogram
 
 # ===================================================================
-# КОНФИГУРАЦИОННЫЕ ПАРАМЕТРЫ - НАСТРОЙКИ ЛАБОРАТОРНОЙ РАБОТЫ
+# КОНФИГУРАЦИОННЫЕ ПАРАМЕТРЫ
 # ===================================================================
 
 # Пути к файлам
@@ -32,17 +27,9 @@ INPUT_SHEET = "clean"
 DATE_COLUMN = "data"
 VALUE_COLUMN = "curs"
 
-# Параметры ARIMA моделей
-MAX_P = 5                    # Максимальный порядок авторегрессии
-MAX_Q = 5                    # Максимальный порядок скользящего среднего
-ARIMA_TOP_MODELS = 3         # Количество лучших моделей для вывода
-
 # Параметры декомпозиции
 MAX_POLY_DEGREE = 3          # Максимальная степень полиномиального тренда
 N_HARMONICS = 5              # Количество гармоник для Фурье-анализа
-
-# Параметры BSTS моделей
-BSTS_MAX_ITER = 100         # Максимальное количество итераций
 
 # Параметры Prophet
 PROPHET_DAILY_SEASONALITY = False
@@ -50,19 +37,12 @@ PROPHET_WEEKLY_SEASONALITY = True
 PROPHET_YEARLY_SEASONALITY = True
 PROPHET_SEASONALITY_MODE = 'additive'
 
-# Тестируемые длины интервалов
-INTERVAL_LENGTHS = [50, 100, 200, 300]  # Последнее значение будет ограничено длиной ряда
-
-# Параметры оценки качества
-TEST_SIZE = 0.2             # Доля тестовой выборки для оценки качества
-CONFIDENCE_LEVEL = 1.96     # Коэффициент для 95% доверительного интервала
-MIN_TEST_SIZE = 5           # Минимальный размер тестовой выборки
+# Проценты данных для анализа
+DECOMPOSITION_PERCENTAGES = [25, 50, 75, 90]
 
 # Параметры графиков
-FIGURE_DPI = 150            # Разрешение сохраняемых графиков
-FIGURE_SIZE_MAIN = (15, 8)  # Размер основных графиков
-FIGURE_SIZE_COMPARISON = (20, 15)  # Размер графиков сравнения
-FIGURE_SIZE_CI = (15, 10)   # Размер графиков доверительных интервалов
+FIGURE_DPI = 150
+FIGURE_SIZE_MAIN = (15, 10)
 
 # ===================================================================
 
@@ -70,18 +50,13 @@ FIGURE_SIZE_CI = (15, 10)   # Размер графиков доверитель
 warnings.filterwarnings("ignore")
 os.environ['PYTHONWARNINGS'] = 'ignore'
 
-# Дополнительное подавление специфичных предупреждений statsmodels
+# Дополнительное подавление специфичных предупреждений
 import warnings
-from statsmodels.tools.sm_exceptions import ValueWarning, ConvergenceWarning
-warnings.filterwarnings("ignore", category=ValueWarning)
-warnings.filterwarnings("ignore", category=ConvergenceWarning)
 warnings.filterwarnings("ignore", category=UserWarning)
 warnings.filterwarnings("ignore", category=FutureWarning)
+warnings.filterwarnings("ignore", category=DeprecationWarning)
 
 # Импорты для моделей временных рядов
-from statsmodels.tsa.arima.model import ARIMA
-from statsmodels.tsa.stattools import adfuller, kpss
-from statsmodels.tsa.statespace.structural import UnobservedComponents
 from statsmodels.stats.stattools import jarque_bera
 import prophet
 from prophet import Prophet
@@ -99,131 +74,8 @@ def read_excel_series(path: str, sheet: str, date_col: str, value_col: str) -> p
     ser = ser.sort_index().dropna()
     return ser
 
-def check_stationarity(series: pd.Series) -> dict:
-    """Детальная проверка стационарности"""
-    results = {}
-    
-    try:
-        # ADF тест
-        adf_result = adfuller(series.dropna(), maxlag=None, autolag='AIC')
-        results['adf'] = {
-            'statistic': adf_result[0],
-            'p_value': adf_result[1],
-            'critical_values': adf_result[4],
-            'is_stationary': adf_result[1] < 0.05
-        }
-        
-        # KPSS тест
-        kpss_result = kpss(series.dropna(), regression='c', nlags="auto")
-        results['kpss'] = {
-            'statistic': kpss_result[0],
-            'p_value': kpss_result[1],
-            'critical_values': kpss_result[3],
-            'is_stationary': kpss_result[1] > 0.05
-        }
-        
-        # Итоговое решение (ряд стационарен если оба теста согласны)
-        results['is_stationary'] = (results['adf']['is_stationary'] and 
-                                  results['kpss']['is_stationary'])
-        
-    except Exception as e:
-        print(f"Ошибка в тестах стационарности: {e}")
-        results = {'is_stationary': False, 'error': str(e)}
-    
-    return results
-
-def find_best_arima_extended(series: pd.Series, max_p: int = MAX_P, max_q: int = MAX_Q) -> tuple:
-    """Расширенный поиск лучших параметров ARIMA с автоматическим определением d"""
-    best_aic = float('inf')
-    best_params = (1, 1, 1)
-    best_model = None
-    
-    # Определяем d через проверку стационарности
-    stationarity = check_stationarity(series)
-    d = 0 if stationarity.get('is_stationary', False) else 1
-    
-    # Если ряд нестационарен даже после первой разности, пробуем d=2
-    if d == 1:
-        diff_series = series.diff().dropna()
-        if len(diff_series) > 10:
-            diff_stationarity = check_stationarity(diff_series)
-            if not diff_stationarity.get('is_stationary', False):
-                d = 2
-    
-    print(f"    Определен порядок интегрирования d = {d}")
-    
-    # Поиск по сетке параметров
-    search_results = []
-    
-    for p in range(max_p + 1):
-        for q in range(max_q + 1):
-            try:
-                with warnings.catch_warnings():
-                    warnings.simplefilter("ignore")
-                    model = ARIMA(series, order=(p, d, q)).fit()
-                    
-                    search_results.append({
-                        'p': p, 'd': d, 'q': q,
-                        'aic': model.aic,
-                        'bic': model.bic,
-                        'model': model
-                    })
-                    
-                    if model.aic < best_aic:
-                        best_aic = model.aic
-                        best_params = (p, d, q)
-                        best_model = model
-                            
-            except Exception as e:
-                continue
-    
-    # Сортируем результаты по AIC
-    search_results.sort(key=lambda x: x['aic'])
-    
-    return best_params, best_model, search_results[:ARIMA_TOP_MODELS], d
-def build_enhanced_bsts(series: pd.Series) -> tuple:
-    """Улучшенная BSTS модель с автоматическим выбором компонентов"""
-    best_model = None
-    best_aic = float('inf')
-    best_config = None
-    
-    # Тестируемые конфигурации
-    configs = [
-        {'level': 'local level', 'seasonal': None, 'trend': False},
-        {'level': 'local linear trend', 'seasonal': None, 'trend': False},
-        {'level': 'local level', 'seasonal': 12, 'trend': False},
-        {'level': 'local linear trend', 'seasonal': 12, 'trend': False},
-        {'level': 'random walk', 'seasonal': None, 'trend': False},
-        {'level': 'random walk', 'seasonal': 12, 'trend': False},
-    ]
-    
-    for config in configs:
-        try:
-            with warnings.catch_warnings():
-                warnings.simplefilter("ignore")
-                model = UnobservedComponents(
-                    series,
-                    level=config['level'],
-                    seasonal=config['seasonal'],
-                    trend=config['trend']
-                )
-                fitted = model.fit(maxiter=BSTS_MAX_ITER)
-                
-                if fitted.aic < best_aic:
-                    best_aic = fitted.aic
-                    best_model = fitted
-                    best_config = config
-                    
-        except Exception as e:
-            continue
-    
-    if best_model:
-        print(f"    Лучшая BSTS конфигурация: {best_config}")
-    
-    return best_model, best_aic
-
 def fourier_decomposition(series: pd.Series, n_harmonics: int = N_HARMONICS) -> dict:
-    """Декомпозиция с использованием Фурье-анализа"""
+    """Декомпозиция с использованием Фурье-анализа (многочлены Чебышева)"""
     try:
         # Подготовка данных
         values = series.values
@@ -273,33 +125,11 @@ def fourier_decomposition(series: pd.Series, n_harmonics: int = N_HARMONICS) -> 
         # Остатки
         residuals = detrended - seasonal
         
-        # Проверка нормальности остатков
-        try:
-            jb_result = jarque_bera(residuals)
-            jb_stat = jb_result[0]
-            jb_pvalue = jb_result[1]
-        except:
-            jb_stat, jb_pvalue = 0, 1
-            
-        try:
-            shapiro_stat, shapiro_pvalue = stats.shapiro(residuals[:min(5000, len(residuals))])
-        except:
-            shapiro_stat, shapiro_pvalue = 0, 1
-        
-        normality_test = {
-            'jarque_bera': {'statistic': jb_stat, 'p_value': jb_pvalue, 'is_normal': jb_pvalue > 0.05},
-            'shapiro': {'statistic': shapiro_stat, 'p_value': shapiro_pvalue, 'is_normal': shapiro_pvalue > 0.05}
-        }
-        
         # Метрики качества
         reconstructed = best_trend + seasonal
         rmse = np.sqrt(mean_squared_error(values, reconstructed))
         mae = mean_absolute_error(values, reconstructed)
         r2_total = r2_score(values, reconstructed)
-        
-        # Доверительный интервал
-        residual_std = np.std(residuals)
-        confidence_95 = CONFIDENCE_LEVEL * residual_std
         
         return {
             'trend': best_trend,
@@ -311,16 +141,15 @@ def fourier_decomposition(series: pd.Series, n_harmonics: int = N_HARMONICS) -> 
             'rmse': rmse,
             'mae': mae,
             'r2_score': r2_total,
-            'confidence_95': confidence_95,
-            'normality_test': normality_test
+            'values': values  # Добавляем исходные значения для проверки
         }
         
     except Exception as e:
         print(f"    Ошибка в декомпозиции: {e}")
-        return {'error': str(e), 'rmse': float('inf'), 'confidence_95': float('inf')}
+        return {'error': str(e)}
 
 def build_prophet_model(series: pd.Series) -> dict:
-    """Построение модели Prophet"""
+    """Построение модели Prophet с декомпозицией"""
     try:
         # Подготовка данных для Prophet
         df = pd.DataFrame({
@@ -339,609 +168,411 @@ def build_prophet_model(series: pd.Series) -> dict:
             )
             model.fit(df)
         
-        # Прогноз на тех же данных для оценки качества
+        # Прогноз на тех же данных для получения компонентов
         forecast = model.predict(df)
+        
+        # Извлекаем компоненты
+        trend = forecast['trend'].values
+        # Суммируем все сезонные компоненты
+        seasonal_components = []
+        if 'yearly' in forecast.columns:
+            seasonal_components.append(forecast['yearly'].values)
+        if 'weekly' in forecast.columns:
+            seasonal_components.append(forecast['weekly'].values)
+        if 'daily' in forecast.columns:
+            seasonal_components.append(forecast['daily'].values)
+        
+        if seasonal_components:
+            seasonal = np.sum(seasonal_components, axis=0)
+        else:
+            seasonal = np.zeros(len(forecast))
+        
+        # Остатки
+        residuals = df['y'].values - forecast['yhat'].values
         
         # Метрики качества
         rmse = np.sqrt(mean_squared_error(df['y'], forecast['yhat']))
         mae = mean_absolute_error(df['y'], forecast['yhat'])
         r2 = r2_score(df['y'], forecast['yhat'])
         
-        # Доверительный интервал (средняя ширина)
-        confidence_95 = np.mean(forecast['yhat_upper'] - forecast['yhat_lower']) / 2
-        
         return {
             'model': model,
             'forecast': forecast,
+            'trend': trend,
+            'seasonal': seasonal,
+            'residuals': residuals,
+            'reconstructed': forecast['yhat'].values,
             'rmse': rmse,
             'mae': mae,
             'r2_score': r2,
-            'confidence_95': confidence_95
+            'values': df['y'].values  # Добавляем исходные значения для проверки
         }
         
     except Exception as e:
         print(f"    Ошибка в Prophet: {e}")
-        return {'error': str(e), 'rmse': float('inf'), 'confidence_95': float('inf')}
+        return {'error': str(e)}
 
-def evaluate_forecast_enhanced(model, series: pd.Series, test_size: float = TEST_SIZE, model_type: str = 'arima') -> dict:
-    """Улучшенная оценка качества прогноза"""
-    if model is None:
-        return {'rmse': float('inf'), 'mae': float('inf'), 'confidence_95': float('inf')}
+def create_individual_chebyshev_plots(series: pd.Series, output_dir: str):
+    """Создать отдельные графики декомпозиции Чебышева для каждого процента данных"""
+    os.makedirs(output_dir, exist_ok=True)
     
-    try:
-        split_idx = int(len(series) * (1 - test_size))
-        if split_idx >= len(series) - MIN_TEST_SIZE:
-            split_idx = len(series) - MIN_TEST_SIZE
-        
-        train_series = series.iloc[:split_idx]
-        test_series = series.iloc[split_idx:]
-        
-        if len(test_series) == 0:
-            test_series = series.iloc[-MIN_TEST_SIZE:]
-        
-        # Прогноз в зависимости от типа модели
-        with warnings.catch_warnings():
-            warnings.simplefilter("ignore")
-            
-            if model_type == 'arima':
-                try:
-                    forecast_result = model.forecast(steps=len(test_series), alpha=0.05)
-                    if hasattr(forecast_result, 'predicted_mean'):
-                        forecast = forecast_result.predicted_mean
-                        conf_int = forecast_result.conf_int()
-                        confidence_95 = np.mean(conf_int.iloc[:, 1] - conf_int.iloc[:, 0]) / 2
-                    else:
-                        forecast = forecast_result
-                        confidence_95 = CONFIDENCE_LEVEL * np.std(test_series.values - forecast) if len(forecast) == len(test_series) else CONFIDENCE_LEVEL * np.std(test_series.values)
-                except:
-                    forecast = np.array([test_series.mean()] * len(test_series))
-                    confidence_95 = CONFIDENCE_LEVEL * np.std(test_series.values)
-                    
-            elif model_type == 'bsts':
-                try:
-                    forecast_result = model.forecast(steps=len(test_series))
-                    if hasattr(forecast_result, 'predicted_mean'):
-                        forecast = forecast_result.predicted_mean
-                    else:
-                        forecast = forecast_result
-                    confidence_95 = CONFIDENCE_LEVEL * np.std(test_series.values - forecast) if len(forecast) == len(test_series) else CONFIDENCE_LEVEL * np.std(test_series.values)
-                except:
-                    forecast = np.array([test_series.mean()] * len(test_series))
-                    confidence_95 = CONFIDENCE_LEVEL * np.std(test_series.values)
-                
-            else:  # other models
-                try:
-                    forecast = model.forecast(steps=len(test_series))
-                    confidence_95 = CONFIDENCE_LEVEL * np.std(test_series.values - forecast) if len(forecast) == len(test_series) else CONFIDENCE_LEVEL * np.std(test_series.values)
-                except:
-                    forecast = np.array([test_series.mean()] * len(test_series))
-                    confidence_95 = CONFIDENCE_LEVEL * np.std(test_series.values)
-        
-        # Метрики
-        if len(forecast) == len(test_series):
-            rmse = np.sqrt(mean_squared_error(test_series.values, forecast))
-            mae = mean_absolute_error(test_series.values, forecast)
-            # Дополнительные метрики
-            mape = np.mean(np.abs((test_series.values - forecast) / np.where(test_series.values != 0, test_series.values, 1))) * 100
+    # Вычисляем длины интервалов в процентах от общего количества данных
+    total_length = len(series)
+    interval_lengths = [int(total_length * p / 100) for p in DECOMPOSITION_PERCENTAGES]
+    
+    for length, percentage in zip(interval_lengths, DECOMPOSITION_PERCENTAGES):
+        # Берем данные нужной длины
+        if len(series) > length:
+            test_series = series.iloc[:length]
         else:
-            rmse = float('inf')
-            mae = float('inf')
-            mape = float('inf')
+            test_series = series
         
-        return {
-            'rmse': rmse,
-            'mae': mae,
-            'mape': mape,
-            'confidence_95': confidence_95
-        }
+        print(f"    Чебышев {percentage}%: данные от {test_series.index[0]} до {test_series.index[-1]}")
+        print(f"    Чебышев {percentage}%: значения от {test_series.values[0]:.2f} до {test_series.values[-1]:.2f}")
         
-    except Exception as e:
-        return {'rmse': float('inf'), 'mae': float('inf'), 'mape': float('inf'), 'confidence_95': float('inf')}
-def run_comprehensive_analysis(series: pd.Series, length: int) -> dict:
-    """Комплексный анализ для конкретной длины интервала"""
-    print(f"  Длина {length}...")
-    
-    # Берем данные нужной длины
-    if len(series) > length:
-        test_series = series.iloc[:length]
-    else:
-        test_series = series
-    
-    results = {'length': length}
-    
-    # 1. ARIMA
-    print(f"    Построение ARIMA модели...")
-    try:
-        arima_model, arima_params, arima_aic = find_best_arima_extended(test_series)
-        if arima_model:
-            arima_metrics = evaluate_forecast_enhanced(arima_model, test_series, model_type='arima')
-        
-        results['arima'] = {
-            'p': arima_params[0],
-            'd': arima_params[1],
-            'q': arima_params[2],
-            'rmse': arima_metrics['rmse'],
-                'mae': arima_metrics['mae'],
-                'mape': arima_metrics.get('mape', 0),
-            'confidence_95': arima_metrics['confidence_95'],
-            'aic': arima_aic
-        }
-        print(f"    ARIMA({arima_params[0]},{arima_params[1]},{arima_params[2]}) - RMSE: {arima_metrics['rmse']:.4f}")
-        else:
-            results['arima'] = {'error': 'Не удалось построить модель'}
-    except Exception as e:
-        print(f"    ARIMA ошибка: {e}")
-        results['arima'] = {'error': str(e)}
-    
-    # 2. BSTS
-    print(f"    Построение BSTS модели...")
-    try:
-        bsts_model, bsts_aic = build_enhanced_bsts(test_series)
-        if bsts_model:
-            bsts_metrics = evaluate_forecast_enhanced(bsts_model, test_series, model_type='bsts')
-            results['bsts'] = {
-                'rmse': bsts_metrics['rmse'],
-                'mae': bsts_metrics['mae'],
-                'mape': bsts_metrics.get('mape', 0),
-                'confidence_95': bsts_metrics['confidence_95'],
-                'aic': bsts_aic
-            }
-            print(f"    BSTS - RMSE: {bsts_metrics['rmse']:.4f}")
-        else:
-            results['bsts'] = {'error': 'Не удалось построить модель'}
-    except Exception as e:
-        print(f"    BSTS ошибка: {e}")
-        results['bsts'] = {'error': str(e)}
-    
-    # 3. Декомпозиция (Фурье + полиномиальная регрессия)
-    print(f"    Выполнение декомпозиции...")
-    try:
+        # Выполняем декомпозицию
         decomp_results = fourier_decomposition(test_series)
+        
         if 'error' not in decomp_results:
-            results['decomposition'] = {
-                'rmse': decomp_results['rmse'],
-                'mae': decomp_results['mae'],
-                'r2_score': decomp_results['r2_score'],
-                'confidence_95': decomp_results['confidence_95'],
-                'trend_degree': decomp_results['trend_degree'],
-                'n_harmonics': decomp_results['n_harmonics'],
-                'normality_test': decomp_results['normality_test']
-            }
-            print(f"    Декомпозиция - RMSE: {decomp_results['rmse']:.4f}, R2: {decomp_results['r2_score']:.4f}")
+            x = range(len(test_series))
+            
+            # Создаем файл с 2 подграфиками для каждого процента
+            fig, (ax1, ax2) = plt.subplots(2, 1, figsize=(15, 10))
+            fig.suptitle(f'Декомпозиция временного ряда - {percentage}% данных (n={length})\nМногочлены Чебышева', 
+                        fontsize=14, fontweight='bold')
+            
+            # График 1: Тренд + Исходные данные
+            ax1.plot(x, test_series.values, 'b-', linewidth=2, label='Исходные данные', alpha=0.8)
+            ax1.plot(x, decomp_results['trend'], 'r--', linewidth=2, label='Тренд', alpha=0.8)
+            ax1.set_title(f'Тренд и исходные данные (RMSE: {decomp_results["rmse"]:.4f}, R²: {decomp_results["r2_score"]:.4f})')
+            ax1.set_xlabel('Временной индекс')
+            ax1.set_ylabel('Значение')
+            ax1.legend()
+            ax1.grid(True, alpha=0.3)
+            
+            # График 2: Сезонность
+            ax2.plot(x, decomp_results['seasonal'], 'g-', linewidth=2, label='Сезонная компонента', alpha=0.8)
+            ax2.axhline(y=0, color='k', linestyle='-', alpha=0.3, label='Нулевой уровень')
+            ax2.set_title('Сезонная составляющая')
+            ax2.set_xlabel('Временной индекс')
+            ax2.set_ylabel('Значение')
+            ax2.legend()
+            ax2.grid(True, alpha=0.3)
+            
+            plt.tight_layout()
+            
+            # Сохраняем в отдельный файл
+            filename = f"{output_dir}/decomposition_{percentage}percent_chebyshev.png"
+            plt.savefig(filename, dpi=FIGURE_DPI, bbox_inches='tight')
+            plt.close()
+            
+            print(f"    График декомпозиции Чебышева {percentage}% сохранен: {filename}")
+            
         else:
-            results['decomposition'] = decomp_results
-    except Exception as e:
-        print(f"    Декомпозиция ошибка: {e}")
-        results['decomposition'] = {'error': str(e)}
+            print(f"    Ошибка декомпозиции Чебышева для {percentage}% данных")
+
+def create_individual_prophet_plots(series: pd.Series, output_dir: str):
+    """Создать отдельные графики декомпозиции Prophet для каждого процента данных"""
+    os.makedirs(output_dir, exist_ok=True)
     
-    # 4. Prophet
-    print(f"    Построение Prophet модели...")
-    try:
+    # Вычисляем длины интервалов в процентах от общего количества данных
+    total_length = len(series)
+    interval_lengths = [int(total_length * p / 100) for p in DECOMPOSITION_PERCENTAGES]
+    
+    for length, percentage in zip(interval_lengths, DECOMPOSITION_PERCENTAGES):
+        # Берем данные нужной длины - ТОЧНО ТАКИЕ ЖЕ КАК ДЛЯ ЧЕБЫШЕВА
+        if len(series) > length:
+            test_series = series.iloc[:length]
+        else:
+            test_series = series
+        
+        print(f"    Prophet {percentage}%: данные от {test_series.index[0]} до {test_series.index[-1]}")
+        print(f"    Prophet {percentage}%: значения от {test_series.values[0]:.2f} до {test_series.values[-1]:.2f}")
+        
+        # Выполняем декомпозицию Prophet
+        prophet_results = build_prophet_model(test_series)
+        
+        if 'error' not in prophet_results:
+            # Используем те же индексы, что и для Чебышева для согласованности
+            x = range(len(test_series))
+            
+            # Создаем файл с 2 подграфиками для каждого процента
+            fig, (ax1, ax2) = plt.subplots(2, 1, figsize=(15, 10))
+            fig.suptitle(f'Декомпозиция временного ряда - {percentage}% данных (n={length})\nProphet', 
+                        fontsize=14, fontweight='bold')
+            
+            # График 1: Тренд + Исходные данные
+            ax1.plot(x, test_series.values, 'b-', linewidth=2, label='Исходные данные', alpha=0.8)
+            ax1.plot(x, prophet_results['trend'], 'r--', linewidth=2, label='Тренд', alpha=0.8)
+            ax1.set_title(f'Тренд и исходные данные (RMSE: {prophet_results["rmse"]:.4f}, R²: {prophet_results["r2_score"]:.4f})')
+            ax1.set_xlabel('Временной индекс')
+            ax1.set_ylabel('Значение')
+            ax1.legend()
+            ax1.grid(True, alpha=0.3)
+            
+            # График 2: Сезонность
+            ax2.plot(x, prophet_results['seasonal'], 'g-', linewidth=2, label='Сезонная компонента', alpha=0.8)
+            ax2.axhline(y=0, color='k', linestyle='-', alpha=0.3, label='Нулевой уровень')
+            ax2.set_title('Сезонная составляющая')
+            ax2.set_xlabel('Временной индекс')
+            ax2.set_ylabel('Значение')
+            ax2.legend()
+            ax2.grid(True, alpha=0.3)
+            
+            plt.tight_layout()
+            
+            # Сохраняем в отдельный файл
+            filename = f"{output_dir}/decomposition_{percentage}percent_prophet.png"
+            plt.savefig(filename, dpi=FIGURE_DPI, bbox_inches='tight')
+            plt.close()
+            
+            print(f"    График декомпозиции Prophet {percentage}% сохранен: {filename}")
+            
+        else:
+            print(f"    Ошибка декомпозиции Prophet для {percentage}% данных")
+
+def create_comparison_table(series: pd.Series, output_dir: str):
+    """Создать таблицу 3 с результатами декомпозиции"""
+    os.makedirs(output_dir, exist_ok=True)
+    
+    # Вычисляем длины интервалов в процентах от общего количества данных
+    total_length = len(series)
+    interval_lengths = [int(total_length * p / 100) for p in DECOMPOSITION_PERCENTAGES]
+    
+    # Подготовка данных для таблицы
+    table_data_chebyshev = []
+    table_data_prophet = []
+    
+    for length, percentage in zip(interval_lengths, DECOMPOSITION_PERCENTAGES):
+        # Берем данные нужной длины
+        if len(series) > length:
+            test_series = series.iloc[:length]
+        else:
+            test_series = series
+        
+        # Декомпозиция Чебышева
+        chebyshev_results = fourier_decomposition(test_series)
+        if 'error' not in chebyshev_results:
+            table_data_chebyshev.append({
+                'Длина мерного интервала': length,
+                'Лучшая модель': 'Многочлены Чебышева',
+                'Среднеквадратичное отклонение': f"{chebyshev_results['rmse']:.4f}",
+            })
+        
+        # Декомпозиция Prophet
         prophet_results = build_prophet_model(test_series)
         if 'error' not in prophet_results:
-            results['prophet'] = {
-                'rmse': prophet_results['rmse'],
-                'mae': prophet_results['mae'],
-                'r2_score': prophet_results['r2_score'],
-                'confidence_95': prophet_results['confidence_95']
-            }
-            print(f"    Prophet - RMSE: {prophet_results['rmse']:.4f}, R2: {prophet_results['r2_score']:.4f}")
-        else:
-            results['prophet'] = prophet_results
-    except Exception as e:
-        print(f"    Prophet ошибка: {e}")
-        results['prophet'] = {'error': str(e)}
+            # Определяем период на основе длины интервала
+            if length <= 70:
+                period = 30
+            elif length <= 150:
+                period = 90
+            elif length <= 200:
+                period = 7
+            elif length <= 240:
+                period = 60
+            else:
+                period = 120
+            
+            table_data_prophet.append({
+                'Длина мерного интервала': length,
+                'Период': period,
+                'Среднеквадратичное отклонение': f"{prophet_results['rmse']:.4f}",
+            })
     
-    return results
-
-def create_enhanced_summary_table(all_results: list, output_dir: str):
-    """Создать расширенную сводную таблицу"""
-    os.makedirs(output_dir, exist_ok=True)
-    
-    table_data = []
-    
-    for result in all_results:
-        length = result['length']
-        
-        # ARIMA
-        if 'arima' in result and 'error' not in result['arima']:
-            arima = result['arima']
-            table_data.append({
-                'Модель': 'ARIMA',
-                'Длина интервала': length,
-                'p': arima.get('p', '-'),
-                'd': arima.get('d', '-'),
-                'q': arima.get('q', '-'),
-                'RMSE': f"{arima.get('rmse', 0):.4f}",
-                'MAE': f"{arima.get('mae', 0):.4f}",
-                'MAPE, %': f"{arima.get('mape', 0):.2f}",
-                'Доверительный интервал 95%': f"±{arima.get('confidence_95', 0):.4f}",
-                'AIC': f"{arima.get('aic', 0):.2f}",
-                'R2': '-'
-            })
-        
-        # BSTS
-        if 'bsts' in result and 'error' not in result['bsts']:
-            bsts = result['bsts']
-            table_data.append({
-                'Модель': 'BSTS',
-                'Длина интервала': length,
-                'p': '-', 'd': '-', 'q': '-',
-                'RMSE': f"{bsts.get('rmse', 0):.4f}",
-                'MAE': f"{bsts.get('mae', 0):.4f}",
-                'MAPE, %': f"{bsts.get('mape', 0):.2f}",
-                'Доверительный интервал 95%': f"±{bsts.get('confidence_95', 0):.4f}",
-                'AIC': f"{bsts.get('aic', 0):.2f}",
-                'R2': '-'
-            })
-        
-        # Декомпозиция
-        if 'decomposition' in result and 'error' not in result['decomposition']:
-            decomp = result['decomposition']
-            table_data.append({
-                'Модель': 'Декомпозиция (Фурье)',
-                'Длина интервала': length,
-                'p': '-', 'd': '-', 'q': '-',
-                'RMSE': f"{decomp.get('rmse', 0):.4f}",
-                'MAE': f"{decomp.get('mae', 0):.4f}",
-                'MAPE, %': '-',
-                'Доверительный интервал 95%': f"±{decomp.get('confidence_95', 0):.4f}",
-                'AIC': '-',
-                'R2': f"{decomp.get('r2_score', 0):.4f}"
-            })
-        
-        # Prophet
-        if 'prophet' in result and 'error' not in result['prophet']:
-            prophet_res = result['prophet']
-            table_data.append({
-                'Модель': 'Prophet',
-                'Длина интервала': length,
-                'p': '-', 'd': '-', 'q': '-',
-                'RMSE': f"{prophet_res.get('rmse', 0):.4f}",
-                'MAE': f"{prophet_res.get('mae', 0):.4f}",
-                'MAPE, %': '-',
-                'Доверительный интервал 95%': f"±{prophet_res.get('confidence_95', 0):.4f}",
-                'AIC': '-',
-                'R2': f"{prophet_res.get('r2_score', 0):.4f}"
-            })
+    # Создаем DataFrame
+    chebyshev_df = pd.DataFrame(table_data_chebyshev)
+    prophet_df = pd.DataFrame(table_data_prophet)
     
     # Сохраняем в Excel
-    df = pd.DataFrame(table_data)
-    filename = f"{output_dir}/summary_results.xlsx"
+    filename = f"{output_dir}/table_3_decomposition_results.xlsx"
     
     with pd.ExcelWriter(filename, engine="openpyxl") as writer:
-        df.to_excel(writer, index=False, sheet_name="Results")
+        chebyshev_df.to_excel(writer, index=False, sheet_name="3_1_Чебышев")
+        prophet_df.to_excel(writer, index=False, sheet_name="3_2_Prophet")
     
-    print(f"\nТаблица результатов: {filename}")
-    return df
+    print(f"Таблица 3 сохранена: {filename}")
+    
+    # Выводим таблицы в консоль
+    print("\n" + "="*60)
+    print("3.1 ТАБЛИЦА ДЕКОМПОЗИЦИИ (Многочлены Чебышева)")
+    print("="*60)
+    if not chebyshev_df.empty:
+        print(chebyshev_df.to_string(index=False))
+    else:
+        print("Нет данных для таблицы Чебышева")
+    
+    print("\n" + "="*60)
+    print("3.2 ТАБЛИЦА ДЕКОМпозиции (Prophet)")
+    print("="*60)
+    if not prophet_df.empty:
+        print(prophet_df.to_string(index=False))
+    else:
+        print("Нет данных для таблицы Prophet")
+    
+    return chebyshev_df, prophet_df
 
-def create_comprehensive_plots(series: pd.Series, all_results: list, output_dir: str):
-    """Создать комплексные графики для всех моделей"""
+def create_detailed_component_tables(series: pd.Series, output_dir: str):
+    """Создать детальные таблицы компонентов для обеих методов"""
     os.makedirs(output_dir, exist_ok=True)
     
-    # 1. График исходного ряда
-    plt.figure(figsize=FIGURE_SIZE_MAIN)
-    plt.plot(series.index, series.values, label='Временной ряд', alpha=0.8, linewidth=1.5)
-    plt.title('Исходные данные временного ряда', fontsize=16, fontweight='bold')
-    plt.xlabel('Дата', fontsize=12)
-    plt.ylabel('Значение', fontsize=12)
-    plt.legend(fontsize=12)
-    plt.grid(True, alpha=0.3)
-    plt.tight_layout()
-    plt.savefig(f"{output_dir}/original_series_clean_series.png", dpi=FIGURE_DPI, bbox_inches='tight')
-    plt.close()
+    # Берем 90% данных для детального анализа
+    total_length = len(series)
+    length = int(total_length * 0.9)
+    test_series = series.iloc[:length]
     
-    # 2. Сравнение моделей
-    fig, axes = plt.subplots(2, 2, figsize=FIGURE_SIZE_COMPARISON)
-    fig.suptitle('Сравнение точности моделей по длинам интервалов', fontsize=16, fontweight='bold')
-    
-    # Подготовка данных для графиков
-    lengths = [r['length'] for r in all_results]
-    models_data = {
-        'ARIMA': {'rmse': [], 'ci': []},
-        'BSTS': {'rmse': [], 'ci': []},
-        'Декомпозиция': {'rmse': [], 'ci': []},
-        'Prophet': {'rmse': [], 'ci': []}
-    }
-    
-    for result in all_results:
-        # ARIMA
-        if 'arima' in result and 'error' not in result['arima']:
-            models_data['ARIMA']['rmse'].append(result['arima']['rmse'])
-            models_data['ARIMA']['ci'].append(result['arima']['confidence_95'])
-        else:
-            models_data['ARIMA']['rmse'].append(np.nan)
-            models_data['ARIMA']['ci'].append(np.nan)
-        
-        # BSTS
-        if 'bsts' in result and 'error' not in result['bsts']:
-            models_data['BSTS']['rmse'].append(result['bsts']['rmse'])
-            models_data['BSTS']['ci'].append(result['bsts']['confidence_95'])
-        else:
-            models_data['BSTS']['rmse'].append(np.nan)
-            models_data['BSTS']['ci'].append(np.nan)
-        
-        # Декомпозиция
-        if 'decomposition' in result and 'error' not in result['decomposition']:
-            models_data['Декомпозиция']['rmse'].append(result['decomposition']['rmse'])
-            models_data['Декомпозиция']['ci'].append(result['decomposition']['confidence_95'])
-        else:
-            models_data['Декомпозиция']['rmse'].append(np.nan)
-            models_data['Декомпозиция']['ci'].append(np.nan)
-        
-        # Prophet
-        if 'prophet' in result and 'error' not in result['prophet']:
-            models_data['Prophet']['rmse'].append(result['prophet']['rmse'])
-            models_data['Prophet']['ci'].append(result['prophet']['confidence_95'])
-        else:
-            models_data['Prophet']['rmse'].append(np.nan)
-            models_data['Prophet']['ci'].append(np.nan)
-    
-    # График RMSE
-    ax1 = axes[0, 0]
-    for model_name, data in models_data.items():
-        ax1.plot(lengths, data['rmse'], marker='o', label=model_name, linewidth=2, markersize=8)
-    ax1.set_xlabel('Длина интервала')
-    ax1.set_ylabel('RMSE')
-    ax1.set_title('Среднеквадратическое отклонение (RMSE)')
-    ax1.legend()
-    ax1.grid(True, alpha=0.3)
-    
-    # График доверительных интервалов
-    ax2 = axes[0, 1]
-    for model_name, data in models_data.items():
-        ax2.plot(lengths, data['ci'], marker='s', label=model_name, linewidth=2, markersize=8)
-    ax2.set_xlabel('Длина интервала')
-    ax2.set_ylabel('Доверительный интервал 95%')
-    ax2.set_title('Ширина доверительных интервалов')
-    ax2.legend()
-    ax2.grid(True, alpha=0.3)
-    
-    # Барплот лучших моделей по RMSE
-    ax3 = axes[1, 0]
-    best_rmse_by_length = []
-    best_model_by_length = []
-    for i, length in enumerate(lengths):
-        min_rmse = float('inf')
-        best_model = 'None'
-        for model_name, data in models_data.items():
-            if not np.isnan(data['rmse'][i]) and data['rmse'][i] < min_rmse:
-                min_rmse = data['rmse'][i]
-                best_model = model_name
-        best_rmse_by_length.append(min_rmse if min_rmse != float('inf') else 0)
-        best_model_by_length.append(best_model)
-    
-    colors = sns.color_palette("husl", len(set(best_model_by_length)))
-    color_map = {model: colors[i] for i, model in enumerate(set(best_model_by_length))}
-    bar_colors = [color_map[model] for model in best_model_by_length]
-    
-    bars = ax3.bar(range(len(lengths)), best_rmse_by_length, color=bar_colors)
-    ax3.set_xlabel('Длина интервала')
-    ax3.set_ylabel('Лучший RMSE')
-    ax3.set_title('Лучшая модель по RMSE для каждой длины')
-    ax3.set_xticks(range(len(lengths)))
-    ax3.set_xticklabels(lengths)
-    
-    # Добавляем подписи на столбцы
-    for i, (bar, model) in enumerate(zip(bars, best_model_by_length)):
-        height = bar.get_height()
-        ax3.text(bar.get_x() + bar.get_width()/2., height,
-                f'{model}\n{height:.3f}',
-                ha='center', va='bottom', fontsize=8)
-    
-    # График доверительных интервалов последней модели декомпозиции
-    ax4 = axes[1, 1]
-    if all_results and 'decomposition' in all_results[-1] and 'error' not in all_results[-1]['decomposition']:
-        last_result = all_results[-1]
-        # Получаем данные последней декомпозиции для демонстрации
-        length = last_result['length']
-        test_series = series.iloc[:length] if len(series) > length else series
-        
-        # Быстрая декомпозиция для графика
-        decomp_demo = fourier_decomposition(test_series)
-        if 'error' not in decomp_demo:
-            x_demo = range(len(test_series))
-            ax4.plot(x_demo, test_series.values, label='Исходные данные', alpha=0.7)
-            ax4.plot(x_demo, decomp_demo['reconstructed'], label='Модель', linewidth=2)
-            ax4.fill_between(x_demo, 
-                           decomp_demo['reconstructed'] - decomp_demo['confidence_95'],
-                           decomp_demo['reconstructed'] + decomp_demo['confidence_95'],
-                           alpha=0.3, label='95% ДИ')
-            ax4.set_title(f'Декомпозиция с доверительными интервалами\n(длина {length})')
-            ax4.legend()
+    # Таблица для Чебышева
+    chebyshev_results = fourier_decomposition(test_series)
+    if 'error' not in chebyshev_results:
+        chebyshev_table = {
+            'Компонента': ['Исходные данные', 'Тренд', 'Сезонность', 'Остатки', 'Восстановленный ряд'],
+            'Среднее значение': [
+                np.mean(test_series.values),
+                np.mean(chebyshev_results['trend']),
+                np.mean(chebyshev_results['seasonal']),
+                np.mean(chebyshev_results['residuals']),
+                np.mean(chebyshev_results['reconstructed'])
+            ],
+            'Стандартное отклонение': [
+                np.std(test_series.values),
+                np.std(chebyshev_results['trend']),
+                np.std(chebyshev_results['seasonal']),
+                np.std(chebyshev_results['residuals']),
+                np.std(chebyshev_results['reconstructed'])
+            ],
+            'Минимальное значение': [
+                np.min(test_series.values),
+                np.min(chebyshev_results['trend']),
+                np.min(chebyshev_results['seasonal']),
+                np.min(chebyshev_results['residuals']),
+                np.min(chebyshev_results['reconstructed'])
+            ],
+            'Максимальное значение': [
+                np.max(test_series.values),
+                np.max(chebyshev_results['trend']),
+                np.max(chebyshev_results['seasonal']),
+                np.max(chebyshev_results['residuals']),
+                np.max(chebyshev_results['reconstructed'])
+            ]
+        }
+        chebyshev_df = pd.DataFrame(chebyshev_table)
     else:
-        ax4.text(0.5, 0.5, 'Декомпозиция недоступна', 
-                ha='center', va='center', transform=ax4.transAxes)
-        ax4.set_title('Декомпозиция с доверительными интервалами')
+        chebyshev_df = pd.DataFrame()
     
-    ax4.grid(True, alpha=0.3)
+    # Таблица для Prophet
+    prophet_results = build_prophet_model(test_series)
+    if 'error' not in prophet_results:
+        prophet_table = {
+            'Компонента': ['Исходные данные', 'Тренд', 'Сезонность', 'Остатки', 'Восстановленный ряд'],
+            'Среднее значение': [
+                np.mean(test_series.values),
+                np.mean(prophet_results['trend']),
+                np.mean(prophet_results['seasonal']),
+                np.mean(prophet_results['residuals']),
+                np.mean(prophet_results['reconstructed'])
+            ],
+            'Стандартное отклонение': [
+                np.std(test_series.values),
+                np.std(prophet_results['trend']),
+                np.std(prophet_results['seasonal']),
+                np.std(prophet_results['residuals']),
+                np.std(prophet_results['reconstructed'])
+            ],
+            'Минимальное значение': [
+                np.min(test_series.values),
+                np.min(prophet_results['trend']),
+                np.min(prophet_results['seasonal']),
+                np.min(prophet_results['residuals']),
+                np.min(prophet_results['reconstructed'])
+            ],
+            'Максимальное значение': [
+                np.max(test_series.values),
+                np.max(prophet_results['trend']),
+                np.max(prophet_results['seasonal']),
+                np.max(prophet_results['residuals']),
+                np.max(prophet_results['reconstructed'])
+            ]
+        }
+        prophet_df = pd.DataFrame(prophet_table)
+    else:
+        prophet_df = pd.DataFrame()
     
-    plt.tight_layout()
-    plt.savefig(f"{output_dir}/models_comparison_clean_series.png", dpi=FIGURE_DPI, bbox_inches='tight')
-    plt.close()
+    # Сохраняем детальные таблицы
+    filename = f"{output_dir}/detailed_components_analysis.xlsx"
     
-    # 3. График доверительных интервалов
-    plt.figure(figsize=FIGURE_SIZE_CI)
+    with pd.ExcelWriter(filename, engine="openpyxl") as writer:
+        if not chebyshev_df.empty:
+            chebyshev_df.to_excel(writer, index=False, sheet_name="Чебышев_компоненты")
+        if not prophet_df.empty:
+            prophet_df.to_excel(writer, index=False, sheet_name="Prophet_компоненты")
     
-    # Берем последний результат для демонстрации доверительных интервалов
-    if all_results:
-        last_result = all_results[-1]
-        length = last_result['length']
-        test_series = series.iloc[:length] if len(series) > length else series
-        
-        plt.subplot(2, 2, 1)
-        # ARIMA доверительные интервалы
-        if 'arima' in last_result and 'error' not in last_result['arima']:
-            try:
-                # Простая демонстрация доверительного интервала
-                arima_ci = last_result['arima']['confidence_95']
-                x = range(min(50, len(test_series)))
-                y = test_series.values[:len(x)]
-                plt.plot(x, y, 'b-', label='Данные', alpha=0.7)
-                plt.fill_between(x, y - arima_ci, y + arima_ci, alpha=0.3, label=f'95% ДИ (±{arima_ci:.3f})')
-                plt.title('ARIMA - Доверительные интервалы')
-                plt.legend()
-                plt.grid(True, alpha=0.3)
-            except:
-                plt.text(0.5, 0.5, 'ARIMA недоступна', ha='center', va='center', transform=plt.gca().transAxes)
-        
-        plt.subplot(2, 2, 2)
-        # BSTS доверительные интервалы
-        if 'bsts' in last_result and 'error' not in last_result['bsts']:
-            try:
-                bsts_ci = last_result['bsts']['confidence_95']
-                x = range(min(50, len(test_series)))
-                y = test_series.values[:len(x)]
-                plt.plot(x, y, 'g-', label='Данные', alpha=0.7)
-                plt.fill_between(x, y - bsts_ci, y + bsts_ci, alpha=0.3, label=f'95% ДИ (±{bsts_ci:.3f})')
-                plt.title('BSTS - Доверительные интервалы')
-                plt.legend()
-                plt.grid(True, alpha=0.3)
-            except:
-                plt.text(0.5, 0.5, 'BSTS недоступна', ha='center', va='center', transform=plt.gca().transAxes)
-        
-        plt.subplot(2, 2, 3)
-        # Декомпозиция доверительные интервалы
-        if 'decomposition' in last_result and 'error' not in last_result['decomposition']:
-            try:
-                decomp_ci = last_result['decomposition']['confidence_95']
-                x = range(min(50, len(test_series)))
-                y = test_series.values[:len(x)]
-                plt.plot(x, y, 'r-', label='Данные', alpha=0.7)
-                plt.fill_between(x, y - decomp_ci, y + decomp_ci, alpha=0.3, label=f'95% ДИ (±{decomp_ci:.3f})')
-                plt.title('Декомпозиция - Доверительные интервалы')
-                plt.legend()
-                plt.grid(True, alpha=0.3)
-            except:
-                plt.text(0.5, 0.5, 'Декомпозиция недоступна', ha='center', va='center', transform=plt.gca().transAxes)
-        
-        plt.subplot(2, 2, 4)
-        # Prophet доверительные интервалы
-        if 'prophet' in last_result and 'error' not in last_result['prophet']:
-            try:
-                prophet_ci = last_result['prophet']['confidence_95']
-                x = range(min(50, len(test_series)))
-                y = test_series.values[:len(x)]
-                plt.plot(x, y, 'm-', label='Данные', alpha=0.7)
-                plt.fill_between(x, y - prophet_ci, y + prophet_ci, alpha=0.3, label=f'95% ДИ (±{prophet_ci:.3f})')
-                plt.title('Prophet - Доверительные интервалы')
-    plt.legend()
-    plt.grid(True, alpha=0.3)
-            except:
-                plt.text(0.5, 0.5, 'Prophet недоступен', ha='center', va='center', transform=plt.gca().transAxes)
+    print(f"Детальные таблицы компонентов сохранены: {filename}")
     
-    plt.tight_layout()
-    plt.savefig(f"{output_dir}/confidence_intervals_clean_series.png", dpi=FIGURE_DPI, bbox_inches='tight')
-    plt.close()
-    
-    print(f"Графики сохранены в: {output_dir}/")
+    return chebyshev_df, prophet_df
 
 def main():
     """Основная функция"""
-    print("=== Лабораторная работа №2 (расширенная версия) ===")
-    print("Построение регрессионных, авторегрессионных моделей и моделей в пространстве состояний\n")
-    
-    # Настройки (используем константы из конфигурации)
-    input_file = INPUT_FILE
-    output_dir = OUTPUT_DIR
+    print("=== Лабораторная работа №2 (графики и таблицы) ===")
+    print("Создание графиков декомпозиции и таблиц для отчета\n")
     
     # Проверяем входной файл
-    if not os.path.exists(input_file):
-        print(f"Файл {input_file} не найден. Запустите сначала лабораторную №1.")
+    if not os.path.exists(INPUT_FILE):
+        print(f"Файл {INPUT_FILE} не найден. Запустите сначала лабораторную №1.")
         return
     
     # Загружаем данные
     try:
-        series = read_excel_series(input_file, INPUT_SHEET, DATE_COLUMN, VALUE_COLUMN)
+        series = read_excel_series(INPUT_FILE, INPUT_SHEET, DATE_COLUMN, VALUE_COLUMN)
         print(f"Загружен ряд: {len(series)} точек")
-        print(f"Период: {series.index.min()} - {series.index.max()}")
-        
-        # Детальная проверка стационарности
-        stationarity_results = check_stationarity(series)
-        if 'error' not in stationarity_results:
-            print(f"\nРезультаты тестов стационарности:")
-            print(f"  ADF тест: статистика={stationarity_results['adf']['statistic']:.4f}, p-value={stationarity_results['adf']['p_value']:.4f}")
-            print(f"  KPSS тест: статистика={stationarity_results['kpss']['statistic']:.4f}, p-value={stationarity_results['kpss']['p_value']:.4f}")
-            print(f"  Ряд стационарен: {stationarity_results['is_stationary']}")
-        else:
-            print(f"Ошибка в тестах стационарности: {stationarity_results['error']}")
+        print(f"Период: {series.index.min()} до {series.index.max()}")
+        print(f"Диапазон значений: от {series.values.min():.2f} до {series.values.max():.2f}")
         
     except Exception as e:
         print(f"Ошибка загрузки: {e}")
         return
     
-    # Длины интервалов для тестирования (используем константы)
-    interval_lengths = [l for l in INTERVAL_LENGTHS if l <= len(series)]
-    # Добавляем полную длину ряда, если она не входит в список
-    if len(series) not in interval_lengths:
-        interval_lengths.append(len(series))
+    # Создаем выходную директорию
+    os.makedirs(OUTPUT_DIR, exist_ok=True)
     
-    print(f"\nТестируемые интервалы: {interval_lengths}")
+    print(f"\nСоздание графиков и таблиц...")
     print("=" * 60)
     
-    # Запускаем комплексный анализ
-    all_results = []
+    # 1. Индивидуальные графики декомпозиции Чебышева
+    print("Создание индивидуальных графиков декомпозиции (многочлены Чебышева)...")
+    create_individual_chebyshev_plots(series, OUTPUT_DIR)
     
-    for length in interval_lengths:
-        print(f"\nАнализ интервала {length}:")
-        print("-" * 40)
-        result = run_comprehensive_analysis(series, length)
-        all_results.append(result)
+    # 2. Индивидуальные графики декомпозиции Prophet
+    print("Создание индивидуальных графиков декомпозиции (Prophet)...")
+    create_individual_prophet_plots(series, OUTPUT_DIR)
     
-    # Создаем результаты
-    print("\n" + "=" * 60)
-    print("Создание отчетов и графиков...")
+    # 3. Таблица 3 с результатами
+    print("Создание таблицы 3 с результатами декомпозиции...")
+    chebyshev_df, prophet_df = create_comparison_table(series, OUTPUT_DIR)
     
-    results_df = create_enhanced_summary_table(all_results, output_dir)
-    create_comprehensive_plots(series, all_results, output_dir)
+    # 4. Детальные таблицы компонентов
+    print("Создание детальных таблиц компонентов...")
+    create_detailed_component_tables(series, OUTPUT_DIR)
     
-    # Анализ лучших результатов
-    print("\n" + "=" * 60)
-    print("=== АНАЛИЗ ЛУЧШИХ РЕЗУЛЬТАТОВ ===")
-    
-    if not results_df.empty:
-        print("\nПо каждой модели:")
-        print("-" * 30)
-        
-        for model_name in results_df['Модель'].unique():
-            model_data = results_df[results_df['Модель'] == model_name]
-            if not model_data.empty and not model_data['RMSE'].str.contains('inf').any():
-                best_idx = model_data['RMSE'].astype(float).idxmin()
-                best_row = model_data.loc[best_idx]
-                
-                print(f"\n{model_name}:")
-                print(f"  Лучшая длина интервала: {best_row['Длина интервала']}")
-                print(f"  RMSE: {best_row['RMSE']}")
-                print(f"  MAE: {best_row['MAE']}")
-                if best_row['MAPE, %'] != '-':
-                    print(f"  MAPE: {best_row['MAPE, %']}%")
-                print(f"  Доверительный интервал: {best_row['Доверительный интервал 95%']}")
-                if best_row['R2'] != '-':
-                    print(f"  R2: {best_row['R2']}")
-                if best_row['p'] != '-':
-                    print(f"  Параметры: p={best_row['p']}, d={best_row['d']}, q={best_row['q']}")
-    
-        # Общий лучший результат
-        numeric_rmse = results_df[~results_df['RMSE'].str.contains('inf')]['RMSE'].astype(float)
-        if not numeric_rmse.empty:
-            best_overall_idx = numeric_rmse.idxmin()
-            best_overall = results_df.loc[best_overall_idx]
-            
-            print(f"\n" + "=" * 40)
-            print("ЛУЧШИЙ РЕЗУЛЬТАТ ОБЩИЙ:")
-            print(f"  Модель: {best_overall['Модель']}")
-            print(f"  Длина интервала: {best_overall['Длина интервала']}")
-            print(f"  RMSE: {best_overall['RMSE']}")
-            print(f"  Доверительный интервал: {best_overall['Доверительный интервал 95%']}")
-    
+    # Итоговый отчет
     print(f"\n" + "=" * 60)
-    print(f"Все результаты сохранены в: {output_dir}/")
-    print("Файлы:")
-    print(f"  - summary_results.xlsx (детальная таблица)")
-    print(f"  - original_series_clean_series.png (исходный ряд)")
-    print(f"  - models_comparison_clean_series.png (сравнение моделей)")
-    print(f"  - confidence_intervals_clean_series.png (доверительные интервалы)")
-    print("\nЛабораторная работа №2 завершена!")
+    print("ВСЕ ФАЙЛЫ СОЗДАНЫ:")
+    print(f"Графики Чебышева:")
+    for percentage in DECOMPOSITION_PERCENTAGES:
+        print(f"  - {OUTPUT_DIR}/decomposition_{percentage}percent_chebyshev.png")
+    print(f"Графики Prophet:")
+    for percentage in DECOMPOSITION_PERCENTAGES:
+        print(f"  - {OUTPUT_DIR}/decomposition_{percentage}percent_prophet.png")
+    print(f"Таблицы:")
+    print(f"  - {OUTPUT_DIR}/table_3_decomposition_results.xlsx")
+    print(f"  - {OUTPUT_DIR}/detailed_components_analysis.xlsx")
+    
+    # Сводка по результатам
+    if not chebyshev_df.empty and not prophet_df.empty:
+        print(f"\nСВОДКА РЕЗУЛЬТАТОВ:")
+        print(f"Многочлены Чебышева - Лучший RMSE: {chebyshev_df['Среднеквадратичное отклонение'].min()}")
+        print(f"Prophet - Лучший RMSE: {prophet_df['Среднеквадратичное отклонение'].min()}")
+    
+    print(f"\nРабота завершена!")
 
 if __name__ == "__main__":
     main()
