@@ -15,6 +15,7 @@ import matplotlib.pyplot as plt
 import seaborn as sns
 from scipy import stats
 from scipy.fft import fft, fftfreq
+from scipy.signal import periodogram
 
 # ===================================================================
 # КОНФИГУРАЦИОННЫЕ ПАРАМЕТРЫ
@@ -44,6 +45,25 @@ DECOMPOSITION_PERCENTAGES = [25, 50, 75, 90]
 FIGURE_DPI = 150
 FIGURE_SIZE_MAIN = (15, 10)
 
+# Дополнительные параметры для расширенного анализа
+# ARIMA
+MAX_P = 5
+MAX_Q = 5
+ARIMA_TOP_MODELS = 3
+
+# BSTS/SSM
+BSTS_MAX_ITER = 100
+
+# Интервалы и качество
+INTERVAL_LENGTHS = [50, 100, 200, 300]
+TEST_SIZE = 0.2
+CONFIDENCE_LEVEL = 1.96
+MIN_TEST_SIZE = 5
+
+# Размеры графиков расширенного сравнения
+FIGURE_SIZE_COMPARISON = (20, 15)
+FIGURE_SIZE_CI = (15, 10)
+
 # ===================================================================
 
 # Полностью отключаем все предупреждения
@@ -58,6 +78,9 @@ warnings.filterwarnings("ignore", category=DeprecationWarning)
 
 # Импорты для моделей временных рядов
 from statsmodels.stats.stattools import jarque_bera
+from statsmodels.tsa.arima.model import ARIMA
+from statsmodels.tsa.stattools import adfuller, kpss
+from statsmodels.tsa.statespace.structural import UnobservedComponents
 import prophet
 from prophet import Prophet
 
@@ -212,6 +235,219 @@ def build_prophet_model(series: pd.Series) -> dict:
         print(f"    Ошибка в Prophet: {e}")
         return {'error': str(e)}
 
+def check_stationarity(series: pd.Series) -> dict:
+    """Проверка стационарности (ADF и KPSS)"""
+    results = {}
+    try:
+        adf_stat, adf_p, _, _, adf_crit, _ = adfuller(series.dropna(), autolag='AIC')
+        results['adf'] = {'statistic': adf_stat, 'p_value': adf_p, 'critical_values': adf_crit,
+                          'is_stationary': adf_p < 0.05}
+        kpss_stat, kpss_p, _, kpss_crit = kpss(series.dropna(), regression='c', nlags='auto')
+        results['kpss'] = {'statistic': kpss_stat, 'p_value': kpss_p, 'critical_values': kpss_crit,
+                           'is_stationary': kpss_p > 0.05}
+        results['is_stationary'] = results['adf']['is_stationary'] and results['kpss']['is_stationary']
+    except Exception as e:
+        results = {'is_stationary': False, 'error': str(e)}
+    return results
+
+def find_best_arima(series: pd.Series, max_p: int = MAX_P, max_q: int = MAX_Q):
+    """Подбор ARIMA(p,d,q) по AIC с автоматическим d"""
+    best_aic = float('inf')
+    best_model = None
+    best_params = (0, 0, 0)
+    # d по стационарности
+    d = 0 if check_stationarity(series).get('is_stationary', False) else 1
+    if d == 1:
+        diff = series.diff().dropna()
+        if len(diff) > 10 and not check_stationarity(diff).get('is_stationary', True):
+            d = 2
+    for p in range(max_p + 1):
+        for q in range(max_q + 1):
+            try:
+                with warnings.catch_warnings():
+                    warnings.simplefilter('ignore')
+                    model = ARIMA(series, order=(p, d, q)).fit()
+                if model.aic < best_aic:
+                    best_aic = model.aic
+                    best_model = model
+                    best_params = (p, d, q)
+            except Exception:
+                continue
+    return best_params, best_model, best_aic
+
+def build_bsts(series: pd.Series):
+    """Простые конфигурации структурной модели (SSM/BSTS surrogate)."""
+    best_model = None
+    best_aic = float('inf')
+    configs = [
+        {'level': 'local level', 'seasonal': None, 'trend': False},
+        {'level': 'local linear trend', 'seasonal': None, 'trend': False},
+        {'level': 'local level', 'seasonal': 12, 'trend': False},
+        {'level': 'local linear trend', 'seasonal': 12, 'trend': False},
+    ]
+    for cfg in configs:
+        try:
+            with warnings.catch_warnings():
+                warnings.simplefilter('ignore')
+                model = UnobservedComponents(series, level=cfg['level'], seasonal=cfg['seasonal'], trend=cfg['trend'])
+                fitted = model.fit(maxiter=BSTS_MAX_ITER)
+            if fitted.aic < best_aic:
+                best_aic = fitted.aic
+                best_model = fitted
+        except Exception:
+            continue
+    return best_model, best_aic
+
+def evaluate_forecast(model, series: pd.Series, model_type: str) -> dict:
+    """Оценка по hold-out TEST_SIZE с RMSE/MAE/CI."""
+    try:
+        split_idx = int(len(series) * (1 - TEST_SIZE))
+        if split_idx >= len(series) - MIN_TEST_SIZE:
+            split_idx = len(series) - MIN_TEST_SIZE
+        train = series.iloc[:split_idx]
+        test = series.iloc[split_idx:]
+        if model_type == 'arima':
+            res = model.forecast(steps=len(test), alpha=0.05)
+            if hasattr(res, 'predicted_mean'):
+                yhat = np.asarray(res.predicted_mean)
+                ci = res.conf_int()
+                ci_width = np.mean(ci.iloc[:, 1] - ci.iloc[:, 0]) / 2
+            else:
+                yhat = np.asarray(res)
+                ci_width = CONFIDENCE_LEVEL * np.std(test.values - yhat)
+        elif model_type == 'bsts':
+            res = model.forecast(steps=len(test))
+            yhat = np.asarray(res if not hasattr(res, 'predicted_mean') else res.predicted_mean)
+            ci_width = CONFIDENCE_LEVEL * np.std(test.values - yhat)
+        else:
+            return {'rmse': float('inf'), 'mae': float('inf'), 'confidence_95': float('inf')}
+        rmse = np.sqrt(mean_squared_error(test.values, yhat)) if len(yhat) == len(test) else float('inf')
+        mae = mean_absolute_error(test.values, yhat) if len(yhat) == len(test) else float('inf')
+        return {'rmse': rmse, 'mae': mae, 'confidence_95': ci_width}
+    except Exception:
+        return {'rmse': float('inf'), 'mae': float('inf'), 'confidence_95': float('inf')}
+
+def run_extended_analysis(series: pd.Series, length: int) -> dict:
+    """Анализ для определённой длины: ARIMA, BSTS, Декомпозиция, Prophet."""
+    subset = series.iloc[:length] if len(series) > length else series
+    out = {'length': length}
+    # ARIMA
+    try:
+        params, arima_model, aic = find_best_arima(subset)
+        metrics = evaluate_forecast(arima_model, subset, 'arima') if arima_model else {'rmse': float('inf'), 'mae': float('inf'), 'confidence_95': float('inf')}
+        out['arima'] = {'p': params[0], 'd': params[1], 'q': params[2], 'rmse': metrics['rmse'], 'mae': metrics['mae'], 'confidence_95': metrics['confidence_95'], 'aic': aic}
+    except Exception as e:
+        out['arima'] = {'error': str(e)}
+    # BSTS
+    try:
+        bsts_model, bsts_aic = build_bsts(subset)
+        metrics = evaluate_forecast(bsts_model, subset, 'bsts') if bsts_model else {'rmse': float('inf'), 'mae': float('inf'), 'confidence_95': float('inf')}
+        out['bsts'] = {'rmse': metrics['rmse'], 'mae': metrics['mae'], 'confidence_95': metrics['confidence_95'], 'aic': bsts_aic}
+    except Exception as e:
+        out['bsts'] = {'error': str(e)}
+    # Декомпозиция
+    try:
+        dec = fourier_decomposition(subset)
+        if 'error' not in dec:
+            out['decomposition'] = {'rmse': dec['rmse'], 'mae': dec['mae'], 'r2_score': dec['r2_score'], 'confidence_95': CONFIDENCE_LEVEL * np.std(dec['residuals'])}
+        else:
+            out['decomposition'] = dec
+    except Exception as e:
+        out['decomposition'] = {'error': str(e)}
+    # Prophet
+    try:
+        prop = build_prophet_model(subset)
+        if 'error' not in prop:
+            out['prophet'] = {'rmse': prop['rmse'], 'mae': prop['mae'], 'r2_score': prop['r2_score'], 'confidence_95': np.mean(prop['forecast']['yhat_upper'] - prop['forecast']['yhat_lower']) / 2}
+        else:
+            out['prophet'] = prop
+    except Exception as e:
+        out['prophet'] = {'error': str(e)}
+    return out
+
+def create_extended_summary(all_results: list, output_dir: str):
+    os.makedirs(output_dir, exist_ok=True)
+    rows = []
+    for r in all_results:
+        L = r['length']
+        if 'arima' in r and 'error' not in r['arima']:
+            a = r['arima']
+            rows.append({'Модель': 'ARIMA', 'Длина интервала': L, 'p': a['p'], 'd': a['d'], 'q': a['q'], 'RMSE': f"{a['rmse']:.4f}", 'MAE': f"{a['mae']:.4f}", 'Доверительный интервал 95%': f"±{a['confidence_95']:.4f}", 'AIC': f"{a['aic']:.2f}", 'R2': '-'})
+        if 'bsts' in r and 'error' not in r['bsts']:
+            b = r['bsts']
+            rows.append({'Модель': 'BSTS', 'Длина интервала': L, 'p': '-', 'd': '-', 'q': '-', 'RMSE': f"{b['rmse']:.4f}", 'MAE': f"{b['mae']:.4f}", 'Доверительный интервал 95%': f"±{b['confidence_95']:.4f}", 'AIC': f"{b['aic']:.2f}", 'R2': '-'})
+        if 'decomposition' in r and 'error' not in r['decomposition']:
+            drow = r['decomposition']
+            rows.append({'Модель': 'Декомпозиция (Фурье)', 'Длина интервала': L, 'p': '-', 'd': '-', 'q': '-', 'RMSE': f"{drow['rmse']:.4f}", 'MAE': f"{drow['mae']:.4f}", 'Доверительный интервал 95%': f"±{drow['confidence_95'] if 'confidence_95' in drow else 0:.4f}", 'AIC': '-', 'R2': f"{drow['r2_score']:.4f}"})
+        if 'prophet' in r and 'error' not in r['prophet']:
+            p = r['prophet']
+            rows.append({'Модель': 'Prophet', 'Длина интервала': L, 'p': '-', 'd': '-', 'q': '-', 'RMSE': f"{p['rmse']:.4f}", 'MAE': f"{p['mae']:.4f}", 'Доверительный интервал 95%': f"±{p['confidence_95']:.4f}", 'AIC': '-', 'R2': f"{p['r2_score']:.4f}"})
+    df = pd.DataFrame(rows)
+    path = f"{output_dir}/summary_results.xlsx"
+    with pd.ExcelWriter(path, engine='openpyxl') as writer:
+        df.to_excel(writer, index=False, sheet_name='Results')
+    print(f"\nТаблица результатов: {path}")
+    return df
+
+def create_extended_plots(series: pd.Series, all_results: list, output_dir: str):
+    os.makedirs(output_dir, exist_ok=True)
+    # Базовый график исходного ряда
+    plt.figure(figsize=FIGURE_SIZE_MAIN)
+    plt.plot(series.index, series.values, label='Временной ряд', alpha=0.8, linewidth=1.5)
+    plt.title('Исходные данные временного ряда', fontsize=16, fontweight='bold')
+    plt.xlabel('Дата'); plt.ylabel('Значение'); plt.legend(); plt.grid(True, alpha=0.3)
+    plt.tight_layout(); plt.savefig(f"{output_dir}/original_series_clean_series.png", dpi=FIGURE_DPI, bbox_inches='tight'); plt.close()
+    # Сравнение
+    fig, axes = plt.subplots(2, 2, figsize=FIGURE_SIZE_COMPARISON)
+    fig.suptitle('Сравнение точности моделей по длинам интервалов', fontsize=16, fontweight='bold')
+    lengths = [r['length'] for r in all_results]
+    names = ['ARIMA', 'BSTS', 'Декомпозиция', 'Prophet']
+    metrics = {n: {'rmse': [], 'ci': []} for n in names}
+    for r in all_results:
+        for n in names:
+            key = 'decomposition' if n == 'Декомпозиция' else n.lower()
+            if key in r and 'error' not in r[key]:
+                metrics[n]['rmse'].append(r[key]['rmse'])
+                metrics[n]['ci'].append(r[key]['confidence_95'])
+            else:
+                metrics[n]['rmse'].append(np.nan); metrics[n]['ci'].append(np.nan)
+    ax1 = axes[0, 0]
+    for n in names:
+        ax1.plot(lengths, metrics[n]['rmse'], marker='o', label=n, linewidth=2)
+    ax1.set_xlabel('Длина интервала'); ax1.set_ylabel('RMSE'); ax1.set_title('RMSE'); ax1.legend(); ax1.grid(True, alpha=0.3)
+    ax2 = axes[0, 1]
+    for n in names:
+        ax2.plot(lengths, metrics[n]['ci'], marker='s', label=n, linewidth=2)
+    ax2.set_xlabel('Длина интервала'); ax2.set_ylabel('Доверительный интервал 95%'); ax2.set_title('Ширина доверительных интервалов'); ax2.legend(); ax2.grid(True, alpha=0.3)
+    ax3 = axes[1, 0]
+    best = []
+    best_names = []
+    for i, L in enumerate(lengths):
+        m = float('inf'); nm = 'None'
+        for n in names:
+            val = metrics[n]['rmse'][i]
+            if not np.isnan(val) and val < m:
+                m = val; nm = n
+        best.append(0 if m == float('inf') else m); best_names.append(nm)
+    bars = ax3.bar(range(len(lengths)), best)
+    ax3.set_xlabel('Длина интервала'); ax3.set_ylabel('Лучший RMSE'); ax3.set_title('Лучшая модель по RMSE'); ax3.set_xticks(range(len(lengths))); ax3.set_xticklabels(lengths)
+    for i, (b, nm) in enumerate(zip(bars, best_names)):
+        ax3.text(b.get_x()+b.get_width()/2., b.get_height(), f'{nm}\n{b.get_height():.3f}', ha='center', va='bottom', fontsize=8)
+    ax4 = axes[1, 1]
+    if all_results and 'decomposition' in all_results[-1] and 'error' not in all_results[-1]['decomposition']:
+        L = all_results[-1]['length']
+        sub = series.iloc[:L] if len(series) > L else series
+        dec = fourier_decomposition(sub)
+        x = range(len(sub))
+        ax4.plot(x, sub.values, label='Данные', alpha=0.7)
+        ax4.plot(x, dec['reconstructed'], label='Модель', linewidth=2)
+        ci = CONFIDENCE_LEVEL * np.std(dec['residuals'])
+        ax4.fill_between(x, dec['reconstructed']-ci, dec['reconstructed']+ci, alpha=0.3, label='95% ДИ')
+        ax4.set_title(f'Декомпозиция с доверительными интервалами (длина {L})'); ax4.legend()
+    else:
+        ax4.text(0.5, 0.5, 'Декомпозиция недоступна', ha='center', va='center', transform=ax4.transAxes)
+    ax4.grid(True, alpha=0.3)
+    plt.tight_layout(); plt.savefig(f"{output_dir}/models_comparison_clean_series.png", dpi=FIGURE_DPI, bbox_inches='tight'); plt.close()
 def create_individual_chebyshev_plots(series: pd.Series, output_dir: str):
     """Создать отдельные графики декомпозиции Чебышева для каждого процента данных"""
     os.makedirs(output_dir, exist_ok=True)
@@ -607,6 +843,19 @@ def main():
         print(f"Многочлены Чебышева - Лучший RMSE: {chebyshev_df['Среднеквадратичное отклонение'].min()}")
         print(f"Prophet - Лучший RMSE: {prophet_df['Среднеквадратичное отклонение'].min()}")
     
+    # Расширенный анализ (ARIMA, BSTS, сравнения)
+    print("\nЗапуск расширенного анализа моделей...")
+    interval_lengths = [l for l in [50, 100, 200, 300] if l <= len(series)]
+    if len(series) not in interval_lengths:
+        interval_lengths.append(len(series))
+    all_results = []
+    for L in interval_lengths:
+        print(f"\nАнализ интервала {L}")
+        all_results.append(run_extended_analysis(series, L))
+    results_df = create_extended_summary(all_results, OUTPUT_DIR)
+    create_extended_plots(series, all_results, OUTPUT_DIR)
+
+    # Итог
     print(f"\nРабота завершена!")
 
 if __name__ == "__main__":
